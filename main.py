@@ -298,6 +298,56 @@ def calculate_alerts(df: pd.DataFrame, limit: int = 10) -> List[Dict[str, Any]]:
     return alerts[:limit]
 
 
+# Helpers for request normalization and type coercion
+def _normalize_payload(data: Union[List[Dict[str, Any]], Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize incoming payload to a list of row dicts."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    raise HTTPException(status_code=422, detail="'data' must be an object or list of objects")
+
+
+def _build_dataframe(data: Union[List[Dict[str, Any]], Dict[str, Any]]) -> pd.DataFrame:
+    """Create a DataFrame from payload and coerce types used in analysis."""
+    records = _normalize_payload(data)
+    df = pd.DataFrame(records)
+    # Coerce numeric columns used in calculations
+    numeric_cols = [
+        "myntra_available_qty", "nykaa_available_qty", "total_units_sold", "return_rate_avg",
+        "myntra_return_rate", "nykaa_return_rate", "sell_through_rate", "fabric_1_available_meters",
+        "fabric_1_reorder_point", "fabric_2_available_meters", "fabric_2_reorder_point",
+        "fabric_3_available_meters", "fabric_3_reorder_point", "mrp", "myntra_price", "nykaa_price",
+        "myntra_discount_pct", "nykaa_discount_pct", "ad_spend", "roas", "clicks", "impressions",
+        "planned_qty", "completed_qty", "fabric_consumed_meters", "fabric_yield",
+        "myntra_S_qty", "myntra_M_qty", "myntra_L_qty", "myntra_XL_qty",
+        "nykaa_S_qty", "nykaa_M_qty", "nykaa_L_qty", "nykaa_XL_qty"
+    ]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    # Normalize booleans frequently used
+    boolean_cols = [
+        "active_flag", "alert_low_stock_myntra", "alert_fabric_reorder",
+        "alert_high_return_rate", "broken_size_curve"
+    ]
+    def _to_bool(v):
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in ("true", "1", "yes", "y"): return True
+        if s in ("false", "0", "no", "n"): return False
+        return v
+    for col in boolean_cols:
+        if col in df.columns:
+            df[col] = df[col].map(_to_bool)
+    # Lowercase status-like text
+    for col in ["myntra_size_curve_status", "nykaa_size_curve_status"]:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.lower()
+    return df
+
+
 @app.get("/")
 async def root():
     """Health check endpoint"""
@@ -321,10 +371,11 @@ async def analyze_inventory_data(request: InventoryDataRequest):
     Receives raw data from n8n, processes it using pandas, and returns analyzed dashboard data
     """
     try:
-        logger.info(f"Received data with {len(request.data)} records")
+        _records = request.data if isinstance(request.data, list) else [request.data]
+        logger.info(f"Received data with {len(_records)} records")
         
-        # Convert to pandas DataFrame
-        df = pd.DataFrame(request.data)
+        # Convert to pandas DataFrame with coercion
+        df = _build_dataframe(request.data)
         
         if df.empty:
             raise HTTPException(status_code=400, detail="No data provided")
@@ -359,7 +410,7 @@ async def analyze_inventory_data(request: InventoryDataRequest):
 async def analyze_overview(request: InventoryDataRequest):
     """Analyze only overview metrics"""
     try:
-        df = pd.DataFrame(request.data)
+        df = _build_dataframe(request.data)
         overview = calculate_overview_metrics(df)
         return {"overview": overview}
     except Exception as e:
@@ -370,7 +421,7 @@ async def analyze_overview(request: InventoryDataRequest):
 async def analyze_top_skus(request: InventoryDataRequest, limit: int = 5):
     """Analyze top performing SKUs"""
     try:
-        df = pd.DataFrame(request.data)
+        df = _build_dataframe(request.data)
         top_skus = calculate_top_skus(df, limit)
         return {"top_skus": top_skus}
     except Exception as e:
@@ -381,7 +432,7 @@ async def analyze_top_skus(request: InventoryDataRequest, limit: int = 5):
 async def analyze_fabric_status(request: InventoryDataRequest):
     """Analyze fabric status"""
     try:
-        df = pd.DataFrame(request.data)
+        df = _build_dataframe(request.data)
         fabric_status = calculate_fabric_status(df)
         return {"fabric_status": fabric_status}
     except Exception as e:
@@ -392,7 +443,7 @@ async def analyze_fabric_status(request: InventoryDataRequest):
 async def analyze_ad_performance(request: InventoryDataRequest):
     """Analyze ad performance"""
     try:
-        df = pd.DataFrame(request.data)
+        df = _build_dataframe(request.data)
         ad_performance = calculate_ad_performance(df)
         return {"ad_performance": ad_performance}
     except Exception as e:
@@ -403,7 +454,7 @@ async def analyze_ad_performance(request: InventoryDataRequest):
 async def analyze_alerts(request: InventoryDataRequest, limit: int = 10):
     """Analyze alerts"""
     try:
-        df = pd.DataFrame(request.data)
+        df = _build_dataframe(request.data)
         alerts = calculate_alerts(df, limit)
         return {"alerts": alerts}
     except Exception as e:
