@@ -209,3 +209,4 @@ curl -X POST http://localhost:8000/analyze \
 - Trend calculations (change values) are currently set to 0 and can be enhanced with historical data comparison
 - The service is stateless and processes data on-demand
 
+
