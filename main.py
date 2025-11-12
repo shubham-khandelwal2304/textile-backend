@@ -6,7 +6,7 @@ Python FastAPI service for data analysis and processing
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
