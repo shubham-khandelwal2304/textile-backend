@@ -39,7 +39,8 @@ class InventoryDataRequest(BaseModel):
 
 class DashboardArrayRequest(BaseModel):
     """Request model for array of dashboard objects from n8n"""
-    dashboards: List[Dict[str, Any]]
+    dashboards: Optional[List[Dict[str, Any]]] = None
+    data: Optional[List[Dict[str, Any]]] = None  # Accept 'data' field for n8n compatibility
 
 
 class DashboardResponse(BaseModel):
@@ -685,16 +686,72 @@ async def aggregate_dashboards(request: DashboardArrayRequest):
     """
     Aggregate multiple dashboard objects into a single consolidated dashboard
     Accepts an array of dashboard objects from n8n and performs data analysis using pandas
+    Supports both 'dashboards' and 'data' field names for n8n compatibility
+    
+    If raw inventory data is sent (items with 'style_id', 'style_name', etc.), 
+    it will first analyze each item to create dashboards, then aggregate them.
+    If dashboard objects are sent (items with 'dashboard' key), it will aggregate directly.
     """
     try:
-        logger.info(f"Received {len(request.dashboards)} dashboard objects for aggregation")
+        # Support both 'dashboards' and 'data' field names
+        input_array = request.dashboards or request.data
         
-        # Aggregate all dashboards
-        aggregated_dashboard = aggregate_dashboard_data(request.dashboards)
+        if not input_array:
+            raise HTTPException(
+                status_code=422, 
+                detail="Either 'dashboards' or 'data' field is required"
+            )
+        
+        logger.info(f"Received {len(input_array)} items for processing")
+        
+        # Check if input is raw inventory data or dashboard objects
+        # If first item has 'dashboard' key, it's already dashboard objects
+        # Otherwise, it's raw inventory data that needs to be analyzed first
+        if input_array and len(input_array) > 0:
+            first_item = input_array[0]
+            if isinstance(first_item, dict) and 'dashboard' in first_item:
+                # Already dashboard objects - aggregate directly
+                logger.info("Input appears to be dashboard objects, aggregating directly")
+                aggregated_dashboard = aggregate_dashboard_data(input_array)
+            else:
+                # Raw inventory data - analyze all together as a batch (more efficient)
+                logger.info("Input appears to be raw inventory data, analyzing as batch")
+                try:
+                    # Build dataframe from all items
+                    df = _build_dataframe(input_array)
+                    if df.empty:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="No valid data could be analyzed from input"
+                        )
+                    
+                    # Create a single dashboard from all the data
+                    aggregated_dashboard = {
+                        "overview": calculate_overview_metrics(df),
+                        "top_skus": calculate_top_skus(df),
+                        "fabric_status": calculate_fabric_status(df),
+                        "ad_performance": calculate_ad_performance(df),
+                        "alerts": calculate_alerts(df)
+                    }
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    logger.error(f"Error analyzing raw inventory data: {str(e)}", exc_info=True)
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Error analyzing inventory data: {str(e)}"
+                    )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Input array is empty"
+            )
         
         logger.info("Dashboard aggregation completed successfully")
         return {"dashboard": aggregated_dashboard}
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error aggregating dashboard data: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error aggregating dashboard data: {str(e)}")
