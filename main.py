@@ -37,6 +37,11 @@ class InventoryDataRequest(BaseModel):
     data: List[Dict[str, Any]]
 
 
+class DashboardArrayRequest(BaseModel):
+    """Request model for array of dashboard objects from n8n"""
+    dashboards: List[Dict[str, Any]]
+
+
 class DashboardResponse(BaseModel):
     """Response model for analyzed dashboard data"""
     overview: Dict[str, Any]
@@ -298,6 +303,220 @@ def calculate_alerts(df: pd.DataFrame, limit: int = 10) -> List[Dict[str, Any]]:
     return alerts[:limit]
 
 
+def aggregate_dashboard_data(dashboard_array: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Aggregate an array of dashboard objects into a single consolidated dashboard using pandas
+    This function performs data analysis and aggregation on multiple dashboard results
+    """
+    if not dashboard_array or len(dashboard_array) == 0:
+        return {
+            "overview": {},
+            "top_skus": [],
+            "fabric_status": [],
+            "ad_performance": [],
+            "alerts": []
+        }
+    
+    # Extract all dashboard objects
+    dashboards = [item.get('dashboard') for item in dashboard_array if item.get('dashboard')]
+    
+    if not dashboards:
+        return {
+            "overview": {},
+            "top_skus": [],
+            "fabric_status": [],
+            "ad_performance": [],
+            "alerts": []
+        }
+    
+    logger.info(f"Aggregating {len(dashboards)} dashboard objects")
+    
+    # Convert to DataFrame for easier aggregation
+    overviews_df = pd.DataFrame([d.get('overview', {}) for d in dashboards])
+    
+    # Aggregate Overview Metrics using pandas
+    def safe_sum(series_name):
+        if series_name in overviews_df.columns:
+            return int(overviews_df[series_name].sum())
+        return 0
+    
+    def safe_avg(series_name):
+        if series_name in overviews_df.columns:
+            valid_values = overviews_df[overviews_df[series_name] > 0][series_name]
+            if len(valid_values) > 0:
+                return valid_values.mean()
+        return 0
+    
+    overview = {
+        "total_active_styles": safe_sum('total_active_styles'),
+        "total_active_styles_change": 0,
+        "fabrics_that_require_replenishment": safe_sum('fabrics_that_require_replenishment'),
+        "fabrics_that_require_replenishment_change": 0,
+        "avg_days_of_cover": int(safe_avg('avg_days_of_cover')),
+        "avg_days_of_cover_change": 0,
+        "total_units_sold": safe_sum('total_units_sold'),
+        "total_units_sold_change": 0,
+        "avg_return_rate": round(safe_avg('avg_return_rate'), 2),
+        "avg_return_rate_change": 0.0,
+        "styles_need_replenishment": safe_sum('styles_need_replenishment'),
+        "styles_need_replenishment_change": 0,
+        "styles_broken": safe_sum('styles_broken'),
+        "styles_broken_change": 0,
+        "styles_out_of_stock": safe_sum('styles_out_of_stock'),
+        "styles_out_of_stock_change": 0
+    }
+    
+    # Aggregate Top SKUs - combine all and use pandas to sort and deduplicate
+    all_top_skus = []
+    for dashboard in dashboards:
+        all_top_skus.extend(dashboard.get('top_skus', []))
+    
+    if all_top_skus:
+        top_skus_df = pd.DataFrame(all_top_skus)
+        if not top_skus_df.empty:
+            # Remove duplicates by style_name and ad_platform, keep highest sell_through_rate
+            top_skus_df = top_skus_df.sort_values('sell_through_rate', ascending=False)
+            top_skus_df = top_skus_df.drop_duplicates(subset=['style_name', 'ad_platform'], keep='first')
+            top_skus = top_skus_df.head(5).to_dict('records')
+            # Round numeric values
+            for sku in top_skus:
+                if 'sell_through_rate' in sku:
+                    sku['sell_through_rate'] = round(float(sku['sell_through_rate']), 0)
+                if 'roas' in sku:
+                    sku['roas'] = round(float(sku['roas']), 1)
+        else:
+            top_skus = []
+    else:
+        top_skus = []
+    
+    # Aggregate Fabric Status by fabric_type using pandas
+    all_fabrics = []
+    for dashboard in dashboards:
+        all_fabrics.extend(dashboard.get('fabric_status', []))
+    
+    if all_fabrics:
+        fabrics_df = pd.DataFrame(all_fabrics)
+        if not fabrics_df.empty and 'fabric_type' in fabrics_df.columns:
+            # Group by fabric_type and aggregate
+            fabric_agg = fabrics_df.groupby('fabric_type').agg({
+                'available': 'sum',
+                'reorder_point': 'max'
+            }).reset_index()
+            
+            # Calculate percent_consumed and status
+            fabric_status = []
+            for _, row in fabric_agg.iterrows():
+                available = float(row['available'])
+                reorder_point = float(row['reorder_point'])
+                percent_consumed = round((available / reorder_point * 100), 1) if reorder_point > 0 else 0
+                
+                if available < reorder_point * 0.8:
+                    status = 'LOW'
+                elif available < reorder_point:
+                    status = 'WARNING'
+                else:
+                    status = 'GOOD'
+                
+                fabric_status.append({
+                    "fabric_type": str(row['fabric_type']),
+                    "available": available,
+                    "reorder_point": reorder_point,
+                    "percent_consumed": percent_consumed,
+                    "status": status
+                })
+            
+            # Sort by status priority
+            status_order = {'LOW': 0, 'WARNING': 1, 'GOOD': 2}
+            fabric_status.sort(key=lambda x: status_order.get(x['status'], 3))
+        else:
+            fabric_status = []
+    else:
+        fabric_status = []
+    
+    # Aggregate Ad Performance by platform using pandas with weighted average
+    all_ads = []
+    for dashboard in dashboards:
+        all_ads.extend(dashboard.get('ad_performance', []))
+    
+    if all_ads:
+        ads_df = pd.DataFrame(all_ads)
+        if not ads_df.empty and 'ad_platform' in ads_df.columns:
+            # Group by platform and calculate weighted average ROAS
+            ad_performance = []
+            for platform in ads_df['ad_platform'].unique():
+                platform_ads = ads_df[ads_df['ad_platform'] == platform]
+                total_spend = float(platform_ads['total_spend'].sum())
+                
+                # Weighted average ROAS
+                if total_spend > 0:
+                    weighted_roas = (platform_ads['total_spend'] * platform_ads['avg_roas']).sum() / total_spend
+                else:
+                    weighted_roas = float(platform_ads['avg_roas'].mean())
+                
+                ad_performance.append({
+                    "ad_platform": str(platform),
+                    "total_spend": round(total_spend, 0),
+                    "avg_roas": round(weighted_roas, 2)
+                })
+            
+            # Sort by total_spend descending
+            ad_performance.sort(key=lambda x: x['total_spend'], reverse=True)
+        else:
+            ad_performance = []
+    else:
+        ad_performance = []
+    
+    # Aggregate Alerts - combine all and use pandas for sorting
+    all_alerts = []
+    for dashboard in dashboards:
+        all_alerts.extend(dashboard.get('alerts', []))
+    
+    if all_alerts:
+        alerts_df = pd.DataFrame(all_alerts)
+        if not alerts_df.empty:
+            # Remove duplicates by style_id and alert_type if columns exist
+            if 'style_id' in alerts_df.columns and 'alert_type' in alerts_df.columns:
+                alerts_df = alerts_df.drop_duplicates(subset=['style_id', 'alert_type'], keep='first')
+            
+            # Sort by severity and date
+            severity_order = {'critical': 0, 'warning': 1, 'stable': 2}
+            if 'severity' in alerts_df.columns:
+                alerts_df['severity_order'] = alerts_df['severity'].map(lambda x: severity_order.get(x, 3))
+            else:
+                alerts_df['severity_order'] = 3
+            
+            if 'date' in alerts_df.columns:
+                alerts_df['date_parsed'] = pd.to_datetime(alerts_df['date'], errors='coerce')
+            else:
+                alerts_df['date_parsed'] = pd.NaT
+            
+            # Sort and limit
+            alerts_df = alerts_df.sort_values(['severity_order', 'date_parsed'], ascending=[True, False], na_position='last')
+            alerts_df = alerts_df.head(10)
+            
+            # Remove helper columns
+            if 'severity_order' in alerts_df.columns:
+                alerts_df = alerts_df.drop('severity_order', axis=1)
+            if 'date_parsed' in alerts_df.columns:
+                alerts_df = alerts_df.drop('date_parsed', axis=1)
+            
+            alerts = alerts_df.to_dict('records')
+        else:
+            alerts = []
+    else:
+        alerts = []
+    
+    logger.info("Dashboard aggregation completed successfully")
+    
+    return {
+        "overview": overview,
+        "top_skus": top_skus,
+        "fabric_status": fabric_status,
+        "ad_performance": ad_performance,
+        "alerts": alerts
+    }
+
+
 # Helpers for request normalization and type coercion
 def _normalize_payload(data: Union[List[Dict[str, Any]], Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalize incoming payload to a list of row dicts."""
@@ -459,6 +678,46 @@ async def analyze_alerts(request: InventoryDataRequest, limit: int = 10):
         return {"alerts": alerts}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/analyze/aggregate", response_model=Dict[str, Any])
+async def aggregate_dashboards(request: DashboardArrayRequest):
+    """
+    Aggregate multiple dashboard objects into a single consolidated dashboard
+    Accepts an array of dashboard objects from n8n and performs data analysis using pandas
+    """
+    try:
+        logger.info(f"Received {len(request.dashboards)} dashboard objects for aggregation")
+        
+        # Aggregate all dashboards
+        aggregated_dashboard = aggregate_dashboard_data(request.dashboards)
+        
+        logger.info("Dashboard aggregation completed successfully")
+        return {"dashboard": aggregated_dashboard}
+        
+    except Exception as e:
+        logger.error(f"Error aggregating dashboard data: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error aggregating dashboard data: {str(e)}")
+
+
+@app.post("/analyze/aggregate-raw", response_model=Dict[str, Any])
+async def aggregate_dashboards_raw(data: List[Dict[str, Any]]):
+    """
+    Aggregate multiple dashboard objects (raw array format)
+    Accepts a raw array of dashboard objects directly from n8n
+    """
+    try:
+        logger.info(f"Received {len(data)} dashboard objects for aggregation (raw format)")
+        
+        # Aggregate all dashboards
+        aggregated_dashboard = aggregate_dashboard_data(data)
+        
+        logger.info("Dashboard aggregation completed successfully")
+        return {"dashboard": aggregated_dashboard}
+        
+    except Exception as e:
+        logger.error(f"Error aggregating dashboard data: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error aggregating dashboard data: {str(e)}")
 
 
 if __name__ == "__main__":
