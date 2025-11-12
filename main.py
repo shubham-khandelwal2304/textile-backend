@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import logging
+import httpx
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -582,6 +583,43 @@ async def root():
 async def health():
     """Health check endpoint"""
     return {"status": "healthy"}
+
+
+@app.get("/proxy/n8n/dashboard")
+async def proxy_n8n_dashboard():
+    """
+    Proxy endpoint to fetch data from n8n webhook
+    This avoids CORS issues by fetching data server-side
+    """
+    n8n_webhook_url = "https://n8n-excollo.azurewebsites.net/webhook/inventory-dashboard"
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(n8n_webhook_url)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Return the data as-is (it should be an array of dashboard objects)
+            return data
+            
+    except httpx.HTTPStatusError as e:
+        logger.error(f"HTTP error from n8n webhook: {e.response.status_code} - {e.response.text}")
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Error fetching from n8n webhook: {e.response.text}"
+        )
+    except httpx.RequestError as e:
+        logger.error(f"Request error fetching from n8n webhook: {str(e)}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to connect to n8n webhook: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in proxy endpoint: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error in proxy endpoint: {str(e)}"
+        )
 
 
 @app.post("/analyze", response_model=Dict[str, Any])
